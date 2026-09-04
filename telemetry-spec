@@ -1,0 +1,112 @@
+# M3A Query Telemetry — Implementation Spec
+
+Goal: every user query is traceable hop-by-hop through the LangGraph (router → retrieval → RRF → dedup → rerank → editorial → answer → response → follow-up), with inputs, outputs, decisions and reasons recoverable after the fact. Two consumers: a live wall (design 1a) and a per-query forensic view (1b/1c).
+
+Design reference: `M3A Query Flow.dc.html` (options 1a, 1b, 1c).
+
+---
+
+## 1. Identity
+
+- `query_id`: ULID, minted at ingress. Never reused.
+- `trace_id`: same as `query_id` unless the query is a follow-up.
+- `parent_query_id`: set when the router inherits context from a previous query (same user, < N minutes, or explicit thread). Null otherwise.
+- `graph`: `"A"` | `"B"`.
+- `user_id`: hashed or pseudonymous handle; the UI shows it only on hover.
+- `session_id`: per client connection (for grouping re-queries).
+
+Pass `query_id` in LangGraph state so every node can emit against it. Do not derive it from timestamps.
+
+## 2. Event: one row per stage hop
+
+Emit exactly one `stage_event` when a node finishes (or fails). Table `telemetry.stage_events`:
+
+| field | type | notes |
+|---|---|---|
+| event_id | ULID | |
+| query_id | ULID | FK |
+| parent_query_id | ULID null | |
+| graph | text | A / B |
+| user_id | text | |
+| stage | text | enum below |
+| stage_seq | int | order within the query (0,1,2…) — needed because retrieval lists run in parallel |
+| t_in, t_out | timestamptz (µs) | wall clock; `latency_ms = t_out - t_in` computed, not stored |
+| status | text | ok / error / skipped |
+| decision | text | short machine label, e.g. `route=NEWS+RESEARCH` |
+| reason | text | human-readable why, ≤ 300 chars |
+| rule_id | text null | `R-07`, `E-03`… |
+| model | text null | `m3a-rerank-v2`, `claude-…` |
+| version | text | git sha of the graph code |
+| count_in, count_out, count_dropped | int null | |
+| in_ref, out_ref | text null | pointer to payload blob (see §4) |
+| attrs | jsonb | stage-specific fields (§3) |
+
+Stage enum: `ingress, router, retrieve.bm25, retrieve.dense, retrieve.research, retrieve.tweets, rrf, dedup, rerank, editorial, answer, response, followup`.
+
+Add a second table `telemetry.queries` (one row per query, upserted at ingress and finalized at response): `query_id, parent_query_id, graph, user_id, session_id, t_start, t_end, route, status, answer_ref, citation_count, followup_of, error`.
+
+## 3. Per-stage `attrs` (what to capture and why)
+
+**ingress** — `raw_query`, `channel`, `auth_ok`, `rate_ok`.
+
+**router** (regex today, agentic later) — `rules_evaluated: [{rule_id, pattern, matched: bool, spans}]`, `entities: {tickers[], dates[]}`, `route`, `time_window`, `sub_queries: [{target, query_text, k, weight}]`, `fallback_used: bool`. This is the block that matters most for the agentic migration: you want to compare what regex chose vs. what the future router chooses on the same query.
+
+**retrieve.\*** — `query_text`, `k`, `filters`, `index_version`, `results: out_ref` (list of `{doc_id, score, source, ts}`), `count_out`.
+
+**rrf** — `k_constant`, `list_weights`, `lists_in: [{stage, count}]`, `count_out`, `fused: out_ref` (`{doc_id, rrf_score, contributing_lists[]}`).
+
+**dedup** — `method` (simhash / minhash / embedding), `threshold`, `pairs_merged: out_ref` (`{kept_doc_id, dropped_doc_id, similarity}`), `count_dropped`.
+
+**rerank** — `model`, `score_cutoff`, `top_k`, `ranked: out_ref` (`{doc_id, score, rank_before, rank_after}`). `rank_before` is what makes the "3→1" shifts in 1b possible.
+
+**editorial** — `rules_applied: [{rule_id, action: drop|pin|demote|boost, doc_id, reason}]`, `count_in`, `count_out`. Every editorial rule needs a stable `rule_id`; log even when nothing fires (`rules_evaluated`).
+
+**answer** — `model`, `prompt_version` (hash of system prompt), `temperature`, `context_doc_ids[]`, `tokens_in`, `tokens_out`, `ttfb_ms`, `prompt_ref`, `completion_ref`, `citations_used: [doc_id]`, `citations_unused: [doc_id]`.
+
+**response** — `rendered_ref`, `citation_count`, `delivery_ms`, `client_ack: bool`.
+
+**followup** — emitted on the *new* query's ingress when `parent_query_id` is set: `gap_seconds`, `kind: refine|new_ticker|clarify|repeat`, `context_inherited: [...]`.
+
+## 4. Payloads
+
+Do not put document lists or prompts in the event row. Write them as JSON to object storage (S3) under `telemetry/{graph}/{yyyy}/{mm}/{dd}/{query_id}/{stage_seq}-{stage}.json`, store the key in `in_ref` / `out_ref`. The forensic drawer fetches these lazily.
+
+Retention: events 180 days, payloads 30 days (prompt/completion may need shorter for compliance — decide).
+
+## 5. Emission
+
+- One helper: `emit(state, stage, fn)` that wraps a LangGraph node — records `t_in`, runs the node, records `t_out`, `status`, and writes the event + payload. Nodes only fill `decision / reason / attrs`. No node should log directly.
+- Write path: node → in-process queue → batch insert to Postgres (or the existing DB on the EC2) + S3 put. Never block the graph on telemetry; drop with a counter if the queue is full.
+- Also emit every event to a Redis pub/sub channel (or SSE endpoint) `telemetry.live` for the live wall.
+- Errors: emit `status=error` with `reason = exception class + message`, still write partial payload.
+
+Volume at 50 users × 3 queries/day × ~13 hops ≈ 2k rows/day. Postgres is fine; no need for a metrics stack.
+
+## 6. Read API (for the UI)
+
+- `GET /telemetry/live` — SSE stream of `stage_event` rows (drives the electrons in 1a: one electron per `query_id`, position = latest `stage`).
+- `GET /telemetry/queries?graph=A&from=&to=&user=&route=&followups_only=` — rows for 1b.
+- `GET /telemetry/queries/{query_id}` — the query + all its events, ordered by `stage_seq`.
+- `GET /telemetry/payload?ref=` — proxies the S3 object (auth-checked).
+- `GET /telemetry/stats?graph=A&day=` — router split, funnel medians, editorial counts, model latency (the four tiles under the graph in 1a).
+
+## 7. UI behaviours (from the designs)
+
+- 1a: electron per in-flight query; dwell time at a node = `0.35 · log10(latency_ms + 1)` seconds, travel between nodes fixed. Click node → drawer with `decision, reason, count_in/out` and the payload rendered as a list. Hover electron → `query_id · user · current stage · in→out`.
+- 1b: one row per query, columns = stages; expanded row shows router reasons, rerank rank shifts, prompt/completion, follow-up link. Latency bar segments are log-scaled.
+- 1c: funnel of `count_out` per stage for one query, with `count_dropped` and the `rule_id`/reason as the caption.
+
+## 8. Build order
+
+1. `query_id` in graph state + `emit()` wrapper + `stage_events` / `queries` tables. Ship with only `t_in/t_out/status/decision`.
+2. Router and editorial `attrs` (highest value for the agentic migration).
+3. Payload refs to S3 for retrieval / rrf / rerank / answer.
+4. Read API + 1b forensic view.
+5. SSE + 1a live wall. 1c last.
+
+## 9. Open decisions for the team
+
+- Where the DB lives (existing Postgres on the EC2 vs. RDS).
+- Whether prompt/completion payloads are stored verbatim or redacted.
+- Follow-up detection rule (time gap vs. explicit thread id from the client).
+- Whether Graph B shares the stage enum or gets its own list.
